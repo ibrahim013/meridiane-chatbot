@@ -12,9 +12,6 @@ import {
 } from "./guardrails";
 import { createChatRunner } from "./tracing";
 
-const DEFAULT_ORDER_MCP =
-  "https://order-mcp-74afyau24q-uc.a.run.app/mcp";
-
 const SUPPORT_INSTRUCTIONS = `You are Meridian Electronics support. Help with monitors, keyboards, printers, networking, and accessories.
 Use MCP tools: list_products, search_products, get_product for catalog; verify_customer_pin before sharing account details or placing orders; get_customer, list_orders, get_order, create_order as appropriate.
 Be concise and accurate. If you lack a customer_id, ask the user to verify with email and PIN first when needed. If you are not able to proceed, ask the user to contact support.`;
@@ -31,14 +28,12 @@ export async function runSupportChatStream(
   conversationId: string,
   messages: ChatMessage[]
 ): Promise<ReadableStream<Uint8Array>> {
-  const mcpUrl =
-    process.env.ORDER_MCP_URL ??
-    process.env.MCP_SERVER_URL ??
-    DEFAULT_ORDER_MCP;
+  
+  const mcpUrl = process.env.MCP_SERVER_URL;
 
   const mcpServer = new MCPServerStreamableHttp({
     name: "order-mcp",
-    url: mcpUrl,
+    url: mcpUrl ?? "",
   });
 
   await mcpServer.connect();
