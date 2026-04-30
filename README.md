@@ -10,6 +10,7 @@
 - **Order MCP** — `MCPServerStreamableHttp` connects to a remote MCP server for product search, customer verification, orders, etc.
 - **Guardrails** — SDK `InputGuardrail` / `OutputGuardrail` on the agent (approximate input token budget + basic secret/pattern checks). The API route also rejects oversized payloads early using the same token heuristic.
 - **Tracing** — Per-request `Runner` with `workflowName` + `groupId` = client `conversationId`. In **development**, a console span exporter can be registered for local visibility.
+- **Session memory (JS)** — [`MemorySession`](https://github.com/openai/openai-agents-js) from `@openai/agents` plus an in-process `Map` keyed by `conversationId`. Each `POST` sends only the **latest user message** to `Runner.run`; prior turns live in the session. Cold starts can **hydrate** from the client’s full `messages` when the server has no session yet. Canonical reference: [openai-agents-js](https://github.com/openai/openai-agents-js) (not other language SDKs).
 
 ---
 
@@ -43,7 +44,7 @@ npm run lint    # ESLint
 
 ## Architecture
 
-High-level request flow: the browser sends the full transcript plus a stable conversation id; the route validates and may short-circuit; the server connects MCP, runs one streamed agent turn with guardrails, streams UTF-8 text to the client, then closes MCP after the run completes.
+High-level request flow: the browser sends the full transcript plus a stable `conversationId`; the route validates and may short-circuit; the server resolves a **per-conversation `MemorySession`**, optionally hydrates it from the transcript after a restart, connects MCP, runs **one streamed turn** with `Runner.run(..., { session })` (model input = session history + latest user only), streams UTF-8 text to the client, then closes MCP after the run completes.
 
 ```mermaid
 flowchart LR
@@ -55,6 +56,7 @@ flowchart LR
     PG[app/page.tsx]
     RT[app/api/chat/route.ts]
     RS[run-support.ts]
+    SS[session-store.ts]
     GR[guardrails.ts]
     TR[tracing.ts]
   end
@@ -68,6 +70,7 @@ flowchart LR
   SC -->|POST JSON| RT
   RT --> GR
   RT --> RS
+  RS --> SS
   RS --> TR
   RS -->|Agent plus Runner| OAI
   RS -->|MCPServerStreamableHttp| MCP
@@ -82,6 +85,8 @@ sequenceDiagram
   participant Route as chat_route_ts
   participant Run as run_support_ts
   participant Trace as tracing_ts
+  participant SS as session_store
+  participant Mem as MemorySession
   participant MCP as Order_MCP
   participant Agent as OpenAI_Agent_run
 
@@ -91,9 +96,12 @@ sequenceDiagram
     Route-->>UI: 400 JSON error
   else ok
     Route->>Run: runSupportChatStream
+    Run->>SS: getMemorySession
+    SS-->>Run: MemorySession
+    Run->>Mem: hydrate if empty and transcript length gt 1
     Run->>Trace: createChatRunner groupId
     Run->>MCP: connect
-    Run->>Agent: runner.run stream maxTurns
+    Run->>Agent: runner.run session plus delta stream maxTurns
     Note over Agent: inputGuardrails then model plus tools
     Agent->>MCP: MCP tool calls
     Agent-->>Run: toTextStream chunks
@@ -110,7 +118,8 @@ sequenceDiagram
 | [`components/SupportChat.tsx`](components/SupportChat.tsx) | Client UI; generates `conversationId` once; sends `POST /api/chat`; reads streaming body with `TextDecoder`. |
 | [`app/page.tsx`](app/page.tsx) | Meridian branding shell; renders `SupportChat`. |
 | [`app/api/chat/route.ts`](app/api/chat/route.ts) | `POST` handler: JSON body validation, fast token check, error mapping for guardrail tripwires; `maxDuration` for long runs. |
-| [`app/api/chat/run-support.ts`](app/api/chat/run-support.ts) | MCP connect/close lifecycle; builds `Agent` + `Runner.run` with `stream: true`; encodes assistant text to UTF-8 bytes for the HTTP response. |
+| [`app/api/chat/session-store.ts`](app/api/chat/session-store.ts) | In-process `Map<string, MemorySession>`; `getMemorySession(conversationId)` with optional LRU cap via `MAX_IN_MEMORY_SESSIONS`. |
+| [`app/api/chat/run-support.ts`](app/api/chat/run-support.ts) | MCP connect/close; `MemorySession` + optional hydrate; `Runner.run(agent, [user(last)], { session, stream, maxTurns })`; UTF-8 stream to the response. |
 | [`app/api/chat/guardrails.ts`](app/api/chat/guardrails.ts) | `meridianInputTokenGuard`, `meridianOutputSafetyGuard`; shared `estimateTokens` / `flattenAgentInput`. |
 | [`app/api/chat/tracing.ts`](app/api/chat/tracing.ts) | `createChatRunner(conversationId)` with tracing env flags; optional dev console trace processor. |
 | [`app/layout.tsx`](app/layout.tsx) | Root layout; `suppressHydrationWarning` on `<body>` to avoid hydration noise from browser extensions (e.g. Grammarly) mutating the DOM. |
@@ -126,8 +135,20 @@ sequenceDiagram
 | `AGENTS_TRACING_DISABLED` | No | Set to `true` to disable Agents tracing for chat runs. |
 | `AGENTS_TRACE_INCLUDE_SENSITIVE` | No | Set to `true` to include sensitive payloads in traces (default is off unless set). |
 | `OPENAI_TRACE_API_KEY` | No | Optional separate API key for trace export when using `Runner` tracing config. |
+| `MAX_IN_MEMORY_SESSIONS` | No | Max chat sessions kept in the in-memory store (default **500**). Oldest entries are evicted when the cap is exceeded. |
 
 Do not commit real `.env` files with secrets.
+
+---
+
+## Session memory (details)
+
+- **SDK:** JavaScript [`@openai/agents`](https://github.com/openai/openai-agents-js) — [`MemorySession`](node_modules/@openai/agents-core/dist/memory/memorySession.d.ts) implements [`Session`](node_modules/@openai/agents-core/dist/memory/session.d.ts); passed as `session` to [`Runner.run`](node_modules/@openai/agents-core/dist/run.d.ts).
+- **Do not** pass `conversationId` into `runner.run()` options — that path is for OpenAI **server-managed** conversations and changes how history is merged. Tracing still uses `groupId: conversationId` on `new Runner({ ... })` in [`tracing.ts`](app/api/chat/tracing.ts).
+- **Per turn:** `run()` receives only `[user(latestMessage)]`. The runner merges **session history + delta** when preparing the model call; after the stream, new items are persisted into the session.
+- **Cold start / dev restart:** If the session has **no** items yet the client sends a **multi-message** transcript, the server **hydrates** the session with all messages except the last, then runs on the last user line only (so a restarted Node process can recover context from the client).
+- **Limits:** Memory is **per Node process** only (not shared across instances or survives deploy). Use an external store and a custom `Session` implementation for production multi-instance chat.
+- **Other SDKs:** If you have read Agents docs for another language (for example Python), treat them as **conceptual background** only — Meridian implements **JavaScript `@openai/agents`** per the links above.
 
 ---
 
@@ -151,6 +172,8 @@ Rules enforced by the route:
 - `messages` must be a non-empty array of `{ role: "user" \| "assistant", content: string }`.
 - The **last** message must be from the **user** (each request represents one new user turn).
 - Approximate token count of `JSON.stringify(messages)` must not exceed **2000** (same order of magnitude as the input guardrail cap in [`guardrails.ts`](app/api/chat/guardrails.ts)).
+
+**Session behavior:** The client should keep sending the **full** transcript (for UI and for hydrate-after-restart). The server uses the full array for the fast token check and for optional hydration; the agent run uses **session + last user message** only once a session exists.
 
 **Success** — `200` with `Content-Type: text/plain; charset=utf-8` and a streaming body (UTF-8 text chunks).
 

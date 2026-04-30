@@ -10,10 +10,12 @@ import {
   meridianInputGuardrails,
   meridianOutputGuardrails,
 } from "./guardrails";
+import { getMemorySession } from "./session-store";
 import { createChatRunner } from "./tracing";
 
 const SUPPORT_INSTRUCTIONS = `You are Meridian Electronics support. Help with monitors, keyboards, printers, networking, and accessories.
 Use MCP tools: list_products, search_products, get_product for catalog; verify_customer_pin before sharing account details or placing orders; get_customer, list_orders, get_order, create_order as appropriate.
+Get the customer_id from the user's email and PIN Response from verify_customer_pin.
 Be concise and accurate. If you lack a customer_id, ask the user to verify with email and PIN first when needed. If you are not able to proceed, ask the user to contact support.`;
 
 export type ChatMessage = { role: "user" | "assistant"; content: string };
@@ -48,10 +50,20 @@ export async function runSupportChatStream(
   });
 
   const runner = createChatRunner(conversationId);
-  const items = messagesToItems(messages);
+  const session = getMemorySession(conversationId);
 
-  const result = await runner.run(agent, items, {
-    stream: true
+  const prior = await session.getItems();
+  if (prior.length === 0 && messages.length > 1) {
+    await session.addItems(messagesToItems(messages.slice(0, -1)));
+  }
+
+  const last = messages[messages.length - 1];
+  const delta: AgentInputItem[] = [user(last.content)];
+
+  const result = await runner.run(agent, delta, {
+    session,
+    stream: true,
+    maxTurns: 40,
   });
 
   const textStream = result.toTextStream({
