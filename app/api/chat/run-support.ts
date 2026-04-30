@@ -51,8 +51,7 @@ export async function runSupportChatStream(
   const items = messagesToItems(messages);
 
   const result = await runner.run(agent, items, {
-    stream: true,
-    maxTurns: 40,
+    stream: true
   });
 
   const textStream = result.toTextStream({
